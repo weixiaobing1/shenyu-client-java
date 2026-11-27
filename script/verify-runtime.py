@@ -39,6 +39,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
 import uuid
+import runtime_scenarios
 
 sys.dont_write_bytecode = True
 NAMESPACE = "649330b6-c2d7-4edc-be8e-8a54df9eb385"
@@ -46,6 +47,7 @@ EXAMPLE = "shenyu-examples/shenyu-examples-http"
 GRPC_EXAMPLE = "shenyu-examples/shenyu-examples-grpc"
 MCP_EXAMPLE = "shenyu-examples/shenyu-examples-mcp"
 EXAMPLES = ",".join((EXAMPLE, GRPC_EXAMPLE, MCP_EXAMPLE))
+SUITES = ("core", "websocket", "dubbo")
 VERSION_HEADER = "X-Shenyu-Register-Protocol-Version"
 CLIENT_HEADER = "X-Shenyu-Client-Version"
 OPENER = build_opener(ProxyHandler({}))
@@ -53,7 +55,8 @@ OPENER = build_opener(ProxyHandler({}))
 
 def request(url, body=None, headers=None, method=None):
     data = None if body is None else json.dumps(body).encode()
-    supplied = {"Content-Type": "application/json", **(headers or {})}
+    supplied = {"Content-Type": "application/json"} if body is not None else {}
+    supplied.update(headers or {})
     try:
         response = OPENER.open(Request(url, data=data, headers=supplied, method=method), timeout=5)
     except HTTPError as error:
@@ -91,7 +94,7 @@ def client_build_fingerprint(root):
     return digest.hexdigest()
 
 
-def gateway_upstream_data(log, context):
+def gateway_upstream_data(log, context, plugin=None):
     latest = None
     for line in log.read_text().splitlines():
         marker = line.find('{"groupType":"DISCOVER_UPSTREAM"')
@@ -99,7 +102,8 @@ def gateway_upstream_data(log, context):
             continue
         frame, _ = json.JSONDecoder().raw_decode(line[marker:])
         for item in frame["data"]:
-            if item.get("selectorName") == context and item.get("namespaceId") == NAMESPACE:
+            if (item.get("selectorName") == context and item.get("namespaceId") == NAMESPACE
+                    and (plugin is None or item.get("pluginName") == plugin)):
                 latest = item["upstreamDataList"]
     return latest
 
@@ -319,18 +323,23 @@ class Runtime:
 
 def run(root, args):
     manifest = json.loads((root / ".github/migration-source.json").read_text())
-    main = (args.main_source or root / "target/foundation-source").resolve()
+    foundation = (args.main_source or root / "target/foundation-source").resolve()
+    main = (args.main_runtime_source or foundation).resolve()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
     output = (root / "target/runtime-compatibility" / stamp).resolve()
     output.mkdir(parents=True)
     runtime = Runtime(root, main, output, args.maven_repo)
-    report = {"kind": "source-candidate", "main_revision": manifest["main_revision"],
+    report = {"kind": "source-candidate", "main_revision": manifest["main_revision"], "foundation_revision": manifest["main_revision"],
               "client_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
               "client_changes": subprocess.check_output(["git", "status", "--porcelain"], cwd=root, text=True).splitlines(),
               "foundation_version": manifest["foundation_version"], "client_version": manifest["client_preparation_version"],
               "java": subprocess.run([java_binary(), "-version"], text=True, capture_output=True, check=True).stderr.strip(),
               "started_at": stamp, "checks": {}, "result": "failed"}
     report["client_build_fingerprint"] = client_build_fingerprint(root)
+    suite = args.suite
+    additional = runtime_scenarios.modules(suite)
+    examples = ",".join(additional) if additional else EXAMPLES
+    report["suite"] = suite
     sockets = []
     proxy = None
     try:
@@ -338,41 +347,75 @@ def run(root, args):
         preparation = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(preparation)
         if not args.skip_build:
-            preparation.prepare(root, main, args.maven_repo)
-        if preparation.run(["git", "rev-parse", "HEAD"], main) != manifest["main_revision"]:
+            preparation.prepare(root, foundation, args.maven_repo)
+        foundation_revision = preparation.run(["git", "rev-parse", "HEAD"], foundation)
+        if foundation_revision != manifest["main_revision"]:
+            raise ValueError("Foundation source does not match the pinned commit")
+        if preparation.run(["git", "status", "--porcelain", "--untracked-files=no"], foundation):
+            raise ValueError("Foundation source has tracked changes")
+        report["main_revision"] = preparation.run(["git", "rev-parse", "HEAD"], main)
+        if not args.main_runtime_source and report["main_revision"] != manifest["main_revision"]:
             raise ValueError("Main runtime source does not match the pinned commit")
         if preparation.run(["git", "status", "--porcelain", "--untracked-files=no"], main):
             raise ValueError("Main runtime source has tracked changes")
         common = ["-DskipTests", "-Dmaven.test.skip=true", "-Dmaven.javadoc.skip=true", "-Djacoco.skip=true", "-DskipRemoteResources=true"]
-        profiles = "-Pexamples,runtime-compatibility"
-        receipt = root / "target/runtime-build-fingerprint.txt"
-        if args.skip_build and (not receipt.exists() or receipt.read_text().strip() != report["client_build_fingerprint"]):
-            raise ValueError("Client build inputs changed or no build receipt exists; rerun without --skip-build")
+        profiles = "-Pexamples" if suite == "dubbo" else "-Pexamples,runtime-compatibility"
+        receipt = root / "target" / f"runtime-build-fingerprint-{suite}.txt"
+        build_inputs = json.dumps({
+            "client_build_fingerprint": report["client_build_fingerprint"],
+            "foundation_revision": foundation_revision,
+            "runtime_revision": report["main_revision"],
+            "runtime_source": str(main),
+        }, sort_keys=True)
+        if args.skip_build and (not receipt.exists() or receipt.read_text().strip() != build_inputs):
+            raise ValueError("Client or main runtime build inputs changed; rerun without --skip-build")
         if not args.skip_build:
             runtime.maven(main, ["-pl", "shenyu-admin,shenyu-bootstrap", "-am", "install", *common], "build-main")
-            runtime.maven(root, [profiles, "-pl", EXAMPLES, "-am", "install", *common, "-Ddocker.skip=true"], "build-client")
+            runtime.maven(root, [profiles, "-pl", examples, "-am", "install", *common, "-Ddocker.skip=true"], "build-client")
             for source, selected, profile, name in [(main, "shenyu-admin,shenyu-bootstrap", [], "classpath-main"),
-                                                     (root, EXAMPLES, [profiles], "classpath-client")]:
+                                                     (root, examples, [profiles], "classpath-client")]:
                 runtime.maven(source, [*profile, "-pl", selected, "org.apache.maven.plugins:maven-dependency-plugin:3.6.1:build-classpath",
                                       "-DincludeScope=runtime", "-Dmdep.outputFile=target/runtime-classpath.txt"], name)
             runtime.maven(main, ["-pl", "shenyu-admin", "org.apache.maven.plugins:maven-dependency-plugin:3.6.1:build-classpath",
                                  "-DincludeScope=test", "-Dmdep.outputFile=target/runtime-test-classpath.txt"], "classpath-zookeeper-server")
-            receipt.write_text(report["client_build_fingerprint"] + "\n")
+            receipt.write_text(build_inputs + "\n")
         admin_cp = runtime.classpath(main / "shenyu-admin", "shenyu-admin.jar")
         gateway_cp = runtime.classpath(main / "shenyu-bootstrap", "shenyu-bootstrap.jar")
-        client_cp = runtime.classpath(root / EXAMPLE, "shenyu-examples-http.jar")
-        grpc_cp = runtime.classpath(root / GRPC_EXAMPLE, "shenyu-examples-grpc.jar")
-        mcp_cp = runtime.classpath(root / MCP_EXAMPLE, "shenyu-examples-mcp-" + manifest["client_preparation_version"] + ".jar")
+        if args.gateway_patch_jar:
+            patch_jar = args.gateway_patch_jar.resolve(strict=True)
+            if not patch_jar.is_file() or patch_jar.suffix != ".jar":
+                raise ValueError("Gateway patch must be a JAR file")
+            report["gateway_patch_jar"] = {
+                "path": str(patch_jar),
+                "sha256": hashlib.sha256(patch_jar.read_bytes()).hexdigest(),
+            }
+            gateway_cp = str(patch_jar) + os.pathsep + gateway_cp
+        if additional:
+            app_classpaths = {
+                module: runtime.classpath(root / module, runtime_scenarios.artifact(module, manifest["client_preparation_version"]))
+                for module in additional
+            }
+        else:
+            client_cp = runtime.classpath(root / EXAMPLE, "shenyu-examples-http.jar")
+            grpc_cp = runtime.classpath(root / GRPC_EXAMPLE, "shenyu-examples-grpc.jar")
+            mcp_cp = runtime.classpath(root / MCP_EXAMPLE, "shenyu-examples-mcp-" + manifest["client_preparation_version"] + ".jar")
+            app_classpaths = {EXAMPLE: client_cp, GRPC_EXAMPLE: grpc_cp, MCP_EXAMPLE: mcp_cp}
         # ZooKeeper server needs metrics/snappy dependencies that its client POM marks provided.
         # Reuse Admin's pinned test dependencies, never add server libraries to business clients.
         server_cp = (main / "shenyu-admin/target/runtime-test-classpath.txt").read_text().strip()
         main_owned_classpath(admin_cp)
         main_owned_classpath(gateway_cp)
         main_owned_classpath(server_cp)
-        probe_cp = runtime.compile_probe(gateway_cp + os.pathsep + server_cp)
+        if not additional:
+            probe_cp = runtime.compile_probe(gateway_cp + os.pathsep + server_cp)
         report["checks"]["main_runtime_ownership"] = True
         report["artifacts"] = [{"path": str(Path(entry)), "sha256": hashlib.sha256(Path(entry).read_bytes()).hexdigest()}
-                               for entry in sorted(set(os.pathsep.join((admin_cp, gateway_cp, client_cp, grpc_cp, mcp_cp, server_cp)).split(os.pathsep)))]
+                               for entry in sorted(set(os.pathsep.join((admin_cp, gateway_cp, server_cp, *app_classpaths.values())).split(os.pathsep)))]
+        report["runtime_versions"] = sorted({
+            Path(item["path"]).name for item in report["artifacts"]
+            if re.fullmatch(r"(?:dubbo|spring-boot|zookeeper|shenyu-plugin-apache-dubbo|shenyu-plugin-websocket)-[0-9].*\.jar",
+                            Path(item["path"]).name)
+        })
         for _ in range(10):
             bound = socket.socket()
             bound.bind(("127.0.0.1", 0))
@@ -388,7 +431,9 @@ def run(root, args):
                        "--spring.datasource.url=jdbc:h2:mem:runtime_compatibility;DB_CLOSE_DELAY=-1;MODE=MySQL;",
                        f"--shenyu.jwt.secret-key={uuid.uuid4().hex + uuid.uuid4().hex}",
                        f"--shenyu.sync.websocket.allowOrigins=ws://127.0.0.1:{gateway_port}",
-                       f"--shenyu.sync.websocket.token={token_sync}", "--shenyu.register.props.checked=false"])
+                       f"--shenyu.sync.websocket.token={token_sync}",
+                       f"--shenyu.register.props.checked={'true' if additional else 'false'}",
+                       "--shenyu.register.props.scheduledTime=2"])
         wait_for("Admin readiness", lambda: request(admin_url + "/actuator/health")[0] == 200, runtime.processes)
         status, text, _ = request(admin_url + "/platform/login", {"userName": "admin", "password": "123456"})
         require(status == 200, text)
@@ -410,7 +455,9 @@ def run(root, args):
             plugins = page("/namespace-plugin", name=name)
             plugins = [plugin for plugin in plugins if plugin["name"] == name]
             require(len(plugins) == 1, plugins)
-            admin_mutation("/namespace-plugin/enabled", {"ids": [plugins[0]["id"]], "enabled": True})
+            admin_mutation("/namespace-plugin/enabled", {
+                "ids": [plugins[0]["id"]], "namespaceId": NAMESPACE, "enabled": True,
+            })
 
         def page(path, **query):
             return admin_data(path, currentPage=1, pageSize=100, namespaceId=NAMESPACE, **query)["dataList"]
@@ -427,147 +474,160 @@ def run(root, args):
                       [f"--server.port={gateway_port}", "--server.address=127.0.0.1",
                        f"--shenyu.sync.websocket.urls=ws://127.0.0.1:{admin_port}/websocket",
                        f"--shenyu.sync.websocket.allowOrigin=ws://127.0.0.1:{gateway_port}",
+                       "--logging.level.org.apache.shenyu.plugin.sync.data.websocket.client.ShenyuWebsocketClient=DEBUG",
                        f"--shenyu.sync.websocket.token={token_sync}", f"--shenyu.heartbeat.serverLists={admin_url}"])
         wait_for("gateway readiness", lambda: request(gateway_url + "/actuator/health")[0] == 200, runtime.processes)
 
-        def client(name, context, port, discovery=False, app_name=None, expected_upstreams=None):
-            app_name = app_name or name
-            expected_upstreams = sorted(expected_upstreams or [f"127.0.0.1:{port}"])
-            arguments = [f"--server.port={port}", "--server.address=127.0.0.1",
-                         f"--shenyu.register.serverLists=http://127.0.0.1:{proxy_port}",
-                         f"--shenyu.client.http.props.contextPath={context}", f"--shenyu.client.http.props.appName={app_name}",
-                         "--shenyu.client.http.props.host=127.0.0.1", f"--shenyu.client.http.props.port={port}",
-                         f"--shenyu.discovery.type={'zookeeper' if discovery else 'local'}"]
-            if discovery:
-                arguments += ["--shenyu.discovery.enable=true", "--shenyu.discovery.register=true",
-                              "--shenyu.discovery.protocol=http://", f"--shenyu.discovery.serverList=127.0.0.1:{zk_port}",
-                              f"--shenyu.discovery.props.name={app_name}"]
-            process = runtime.start(name, client_cp, "org.apache.shenyu.examples.http.ShenyuTestHttpApplication", arguments)
-            route = "/test/findByUserId?userId=7602"
-            expected = wait_for(name + " readiness", lambda: response_user(f"http://127.0.0.1:{port}" + route), runtime.processes)
-            wait_for(name + " metadata", lambda: any(row["path"].startswith(context + "/") for row in page("/meta-data/queryList")), runtime.processes)
-            selectors = wait_for(name + " divide selector", lambda: [row for row in page("/selector", pluginId="5", name=context) if row["name"] == context], runtime.processes)
-            wait_for(name + " rules", lambda: page("/rule", selectorId=selectors[0]["id"]), runtime.processes)
-            wait_for(name + " upstream", lambda: sorted(row["url"] for row in (upstreams(context) or [])) == expected_upstreams, runtime.processes)
-            wait_for(name + " gateway proxy", lambda: response_user(gateway_url + context + route) == expected, runtime.processes)
-            wait_for(name + " gateway upstream snapshot", lambda: gateway_snapshot(output / "gateway.log", context) == expected_upstreams, runtime.processes)
-            report["checks"][name + "_registered_and_proxied"] = {"selector_id": selectors[0]["id"], "response": expected}
-            return process, route, expected
+        if additional:
+            sockets[4].close()
+            config = output / "zookeeper.cfg"
+            config.write_text(f"tickTime=2000\ndataDir={output / 'zookeeper-data'}\nclientPort={zk_port}\nclientPortAddress=127.0.0.1\nadmin.enableServer=false\n")
+            runtime.start("zookeeper", server_cp, "org.apache.zookeeper.server.quorum.QuorumPeerMain", [str(config)])
+            wait_for("ZooKeeper readiness", lambda: listening(zk_port), runtime.processes)
+            scenario = runtime_scenarios.Scenario(runtime, report, app_classpaths, proxy,
+                                                 gateway_url, zk_port, page, admin_data,
+                                                 enable_plugin, gateway_upstream_data, request, wait_for, admin_mutation)
+            runtime_scenarios.run(suite, scenario)
+            report["result"] = "passed"
+        else:
+            def client(name, context, port, discovery=False, app_name=None, expected_upstreams=None):
+                app_name = app_name or name
+                expected_upstreams = sorted(expected_upstreams or [f"127.0.0.1:{port}"])
+                arguments = [f"--server.port={port}", "--server.address=127.0.0.1",
+                             f"--shenyu.register.serverLists=http://127.0.0.1:{proxy_port}",
+                             f"--shenyu.client.http.props.contextPath={context}", f"--shenyu.client.http.props.appName={app_name}",
+                             "--shenyu.client.http.props.host=127.0.0.1", f"--shenyu.client.http.props.port={port}",
+                             f"--shenyu.discovery.type={'zookeeper' if discovery else 'local'}"]
+                if discovery:
+                    arguments += ["--shenyu.discovery.enable=true", "--shenyu.discovery.register=true",
+                                  "--shenyu.discovery.protocol=http://", f"--shenyu.discovery.serverList=127.0.0.1:{zk_port}",
+                                  f"--shenyu.discovery.props.name={app_name}"]
+                process = runtime.start(name, client_cp, "org.apache.shenyu.examples.http.ShenyuTestHttpApplication", arguments)
+                route = "/test/findByUserId?userId=7602"
+                expected = wait_for(name + " readiness", lambda: response_user(f"http://127.0.0.1:{port}" + route), runtime.processes)
+                wait_for(name + " metadata", lambda: any(row["path"].startswith(context + "/") for row in page("/meta-data/queryList")), runtime.processes)
+                selectors = wait_for(name + " divide selector", lambda: [row for row in page("/selector", pluginId="5", name=context) if row["name"] == context], runtime.processes)
+                wait_for(name + " rules", lambda: page("/rule", selectorId=selectors[0]["id"]), runtime.processes)
+                wait_for(name + " upstream", lambda: sorted(row["url"] for row in (upstreams(context) or [])) == expected_upstreams, runtime.processes)
+                wait_for(name + " gateway proxy", lambda: response_user(gateway_url + context + route) == expected, runtime.processes)
+                wait_for(name + " gateway upstream snapshot", lambda: gateway_snapshot(output / "gateway.log", context) == expected_upstreams, runtime.processes)
+                report["checks"][name + "_registered_and_proxied"] = {"selector_id": selectors[0]["id"], "response": expected}
+                return process, route, expected
 
-        sockets[3].close()
-        local, route, expected = client("compat-local", "/compat-local", local_port)
-        wait_for("two scheduled client heartbeats", lambda: len(proxy.matching("/shenyu-client/register-uri", "/compat-local", "HEARTBEAT")) >= 2, runtime.processes, timeout=65)
-        instances = wait_for("client instance info in Admin", lambda: [row for row in page("/instance", instancePort=str(local_port)) if row.get("instanceInfo")], runtime.processes)
-        require(isinstance(instances[0]["instanceInfo"], str) and isinstance(json.loads(instances[0]["instanceInfo"]), dict), instances[0])
-        first_beat = instances[0]["lastHeartBeatTime"]
-        wait_for("Admin heartbeat renewal", lambda: any(row["lastHeartBeatTime"] > first_beat for row in page("/instance", instancePort=str(local_port))), runtime.processes, timeout=25)
-        report["checks"]["scheduled_heartbeats_and_instance_info"] = True
-        runtime.stop(local)
-        runtime.processes = [(name, process) for name, process in runtime.processes if process is not local]
-        wait_for("authenticated offline request", lambda: proxy.matching("/shenyu-client/offline", "/compat-local", "OFFLINE"), timeout=20)
-        wait_for("offline upstream removal", lambda: upstreams("/compat-local") == [], runtime.processes[:2], timeout=30)
-        wait_for("offline gateway empty snapshot", lambda: gateway_snapshot(output / "gateway.log", "/compat-local") == [], runtime.processes[:2], timeout=30)
-        wait_for("offline gateway convergence", lambda: gateway_empty(gateway_url + "/compat-local" + route), runtime.processes[:2], timeout=30)
-        report["checks"]["local_shutdown_removed_upstream"] = True
+            sockets[3].close()
+            local, route, expected = client("compat-local", "/compat-local", local_port)
+            wait_for("two scheduled client heartbeats", lambda: len(proxy.matching("/shenyu-client/register-uri", "/compat-local", "HEARTBEAT")) >= 2, runtime.processes, timeout=65)
+            instances = wait_for("client instance info in Admin", lambda: [row for row in page("/instance", instancePort=str(local_port)) if row.get("instanceInfo")], runtime.processes)
+            require(isinstance(instances[0]["instanceInfo"], str) and isinstance(json.loads(instances[0]["instanceInfo"]), dict), instances[0])
+            first_beat = instances[0]["lastHeartBeatTime"]
+            wait_for("Admin heartbeat renewal", lambda: any(row["lastHeartBeatTime"] > first_beat for row in page("/instance", instancePort=str(local_port))), runtime.processes, timeout=25)
+            report["checks"]["scheduled_heartbeats_and_instance_info"] = True
+            runtime.stop(local)
+            runtime.processes = [(name, process) for name, process in runtime.processes if process is not local]
+            wait_for("authenticated offline request", lambda: proxy.matching("/shenyu-client/offline", "/compat-local", "OFFLINE"), timeout=20)
+            wait_for("offline upstream removal", lambda: upstreams("/compat-local") == [], runtime.processes[:2], timeout=30)
+            wait_for("offline gateway empty snapshot", lambda: gateway_snapshot(output / "gateway.log", "/compat-local") == [], runtime.processes[:2], timeout=30)
+            wait_for("offline gateway convergence", lambda: gateway_empty(gateway_url + "/compat-local" + route), runtime.processes[:2], timeout=30)
+            report["checks"]["local_shutdown_removed_upstream"] = True
 
-        # Run the main-owned provider's ZooKeeper version with Admin's server test dependencies.
-        sockets[4].close()
-        config = output / "zookeeper.cfg"
-        config.write_text(f"tickTime=2000\ndataDir={output / 'zookeeper-data'}\nclientPort={zk_port}\nclientPortAddress=127.0.0.1\nadmin.enableServer=false\n")
-        zk = runtime.start("zookeeper", server_cp, "org.apache.zookeeper.server.quorum.QuorumPeerMain", [str(config)])
-        wait_for("ZooKeeper readiness", lambda: listening(zk_port), [("zookeeper", zk)])
-        sockets[5].close()
-        discovered, zk_route, zk_expected = client("compat-zookeeper-a", "/compat-zookeeper", discovery_port, discovery=True, app_name="compat-zookeeper")
-        sockets[6].close()
-        second, _, _ = client("compat-zookeeper-b", "/compat-zookeeper", second_port, discovery=True, app_name="compat-zookeeper",
-                              expected_upstreams=[f"127.0.0.1:{discovery_port}", f"127.0.0.1:{second_port}"])
-        update = runtime.probe("registry-weight-update", probe_cp, ["registry-update", f"127.0.0.1:{zk_port}", "compat-zookeeper", str(second_port), "80"])
-        wait_for("Admin registry weight update", lambda: any(row["url"] == f"127.0.0.1:{second_port}" and row["weight"] == 80
-                 for row in (upstreams("/compat-zookeeper") or [])), runtime.processes)
-        wait_for("gateway registry weight update", lambda: any(row["url"] == f"127.0.0.1:{second_port}" and row["weight"] == 80
-                 for row in (gateway_upstream_data(output / "gateway.log", "/compat-zookeeper") or [])), runtime.processes)
-        report["checks"]["zookeeper_instance_weight_update"] = update
-        configs = proxy.matching("/shenyu-client/register-discoveryConfig")
-        require(any(item["body"]["listenerNode"] == "/shenyu/register/instance/compat-zookeeper" for item in configs), configs)
-        require(not proxy.matching("/shenyu-client/register-uri", "/compat-zookeeper"), "Discovery mode published a local URI")
-        runtime.stop(discovered)
-        runtime.processes = [(name, process) for name, process in runtime.processes if process is not discovered]
-        wait_for("remaining ZooKeeper instance", lambda: sorted(row["url"] for row in (upstreams("/compat-zookeeper") or [])) == [f"127.0.0.1:{second_port}"], runtime.processes)
-        wait_for("remaining gateway instance snapshot", lambda: gateway_snapshot(output / "gateway.log", "/compat-zookeeper") == [f"127.0.0.1:{second_port}"], runtime.processes)
-        wait_for("remaining instance still proxies", lambda: response_user(gateway_url + "/compat-zookeeper" + zk_route) == zk_expected, runtime.processes)
-        runtime.stop(second)
-        runtime.processes = [(name, process) for name, process in runtime.processes if process is not second]
-        wait_for("ZooKeeper instance removal", lambda: upstreams("/compat-zookeeper") == [], runtime.processes[:2], timeout=30)
-        wait_for("discovery gateway empty snapshot", lambda: gateway_snapshot(output / "gateway.log", "/compat-zookeeper") == [], runtime.processes[:2], timeout=30)
-        wait_for("discovery gateway convergence", lambda: gateway_empty(gateway_url + "/compat-zookeeper" + zk_route), runtime.processes[:2], timeout=30)
-        report["checks"]["zookeeper_instance_add_remove"] = {"upstream_counts": [1, 2, 1, 0]}
+            # Run the main-owned provider's ZooKeeper version with Admin's server test dependencies.
+            sockets[4].close()
+            config = output / "zookeeper.cfg"
+            config.write_text(f"tickTime=2000\ndataDir={output / 'zookeeper-data'}\nclientPort={zk_port}\nclientPortAddress=127.0.0.1\nadmin.enableServer=false\n")
+            zk = runtime.start("zookeeper", server_cp, "org.apache.zookeeper.server.quorum.QuorumPeerMain", [str(config)])
+            wait_for("ZooKeeper readiness", lambda: listening(zk_port), [("zookeeper", zk)])
+            sockets[5].close()
+            discovered, zk_route, zk_expected = client("compat-zookeeper-a", "/compat-zookeeper", discovery_port, discovery=True, app_name="compat-zookeeper")
+            sockets[6].close()
+            second, _, _ = client("compat-zookeeper-b", "/compat-zookeeper", second_port, discovery=True, app_name="compat-zookeeper",
+                                  expected_upstreams=[f"127.0.0.1:{discovery_port}", f"127.0.0.1:{second_port}"])
+            update = runtime.probe("registry-weight-update", probe_cp, ["registry-update", f"127.0.0.1:{zk_port}", "compat-zookeeper", str(second_port), "80"])
+            wait_for("Admin registry weight update", lambda: any(row["url"] == f"127.0.0.1:{second_port}" and row["weight"] == 80
+                     for row in (upstreams("/compat-zookeeper") or [])), runtime.processes)
+            wait_for("gateway registry weight update", lambda: any(row["url"] == f"127.0.0.1:{second_port}" and row["weight"] == 80
+                     for row in (gateway_upstream_data(output / "gateway.log", "/compat-zookeeper") or [])), runtime.processes)
+            report["checks"]["zookeeper_instance_weight_update"] = update
+            configs = proxy.matching("/shenyu-client/register-discoveryConfig")
+            require(any(item["body"]["listenerNode"] == "/shenyu/register/instance/compat-zookeeper" for item in configs), configs)
+            require(not proxy.matching("/shenyu-client/register-uri", "/compat-zookeeper"), "Discovery mode published a local URI")
+            runtime.stop(discovered)
+            runtime.processes = [(name, process) for name, process in runtime.processes if process is not discovered]
+            wait_for("remaining ZooKeeper instance", lambda: sorted(row["url"] for row in (upstreams("/compat-zookeeper") or [])) == [f"127.0.0.1:{second_port}"], runtime.processes)
+            wait_for("remaining gateway instance snapshot", lambda: gateway_snapshot(output / "gateway.log", "/compat-zookeeper") == [f"127.0.0.1:{second_port}"], runtime.processes)
+            wait_for("remaining instance still proxies", lambda: response_user(gateway_url + "/compat-zookeeper" + zk_route) == zk_expected, runtime.processes)
+            runtime.stop(second)
+            runtime.processes = [(name, process) for name, process in runtime.processes if process is not second]
+            wait_for("ZooKeeper instance removal", lambda: upstreams("/compat-zookeeper") == [], runtime.processes[:2], timeout=30)
+            wait_for("discovery gateway empty snapshot", lambda: gateway_snapshot(output / "gateway.log", "/compat-zookeeper") == [], runtime.processes[:2], timeout=30)
+            wait_for("discovery gateway convergence", lambda: gateway_empty(gateway_url + "/compat-zookeeper" + zk_route), runtime.processes[:2], timeout=30)
+            report["checks"]["zookeeper_instance_add_remove"] = {"upstream_counts": [1, 2, 1, 0]}
 
-        enable_plugin("grpc")
-        sockets[7].close()
-        sockets[8].close()
-        grpc = runtime.start("grpc-client", grpc_cp, "org.apache.shenyu.examples.grpc.ShenyuTestGrpcApplication",
-                             [f"--server.port={grpc_http_port}", "--server.address=127.0.0.1",
-                              f"--shenyu.register.serverLists=http://127.0.0.1:{proxy_port}",
-                              f"--shenyu.client.grpc.props.ipAndPort=127.0.0.1:{grpc_port}",
-                              "--shenyu.client.grpc.props.host=127.0.0.1",
-                              f"--shenyu.client.grpc.props.port={grpc_port}", "--logging.level.org.apache.shenyu=INFO"])
-        wait_for("gRPC backend readiness", lambda: listening(grpc_port), runtime.processes)
-        wait_for("gRPC metadata", lambda: any(row["path"] == "/grpc/echo" and row["rpcType"] == "grpc" for row in page("/meta-data/queryList")), runtime.processes)
-        def grpc_response():
-            status, body, _ = request(gateway_url + "/grpc/echo", {"data": [{"message": "migration-7602"}]})
-            value = json.loads(body)
-            return value if status == 200 and isinstance(value, list) and value and value[0].get("message") == "ReceivedHELLO" else None
-        response = wait_for("real gRPC gateway proxy", grpc_response, runtime.processes)
-        report["checks"]["grpc_registered_and_proxied"] = response
-        rpc_cases = {
-            "helloService/hello": ({"data": [{"data": "migration-7602"}]}, [{"data": "hello: migration-7602"}]),
-            "unaryFun": ({"data": [{"text": "migration-7602"}]}, [{"text": "unaryFun response: hello gRPC"}]),
-            "serverStreamingFun": ({"data": [{"text": "migration-7602"}]}, [{"text": f"serverStreamingFun response: hello {index}"} for index in range(10)]),
-            "clientStreamingFun": ({"data": [{"text": "first"}, {"text": "second"}]}, [{"text": "clientStreamingFun onCompleted"}]),
-            "bidiStreamingFun": ({"data": [{"text": "first"}, {"text": "second"}]}, [{"text": "bidiStreamingFun response: hello"},
-                                                                                      {"text": "bidiStreamingFun response: hello"}, {"text": "bidiStreamingFun onCompleted"}]),
-        }
-        rpc_results = {}
-        for method, (payload, expected_response) in rpc_cases.items():
-            def rpc_response():
-                status, body, _ = request(gateway_url + "/grpc/" + method, payload)
+            enable_plugin("grpc")
+            sockets[7].close()
+            sockets[8].close()
+            grpc = runtime.start("grpc-client", grpc_cp, "org.apache.shenyu.examples.grpc.ShenyuTestGrpcApplication",
+                                 [f"--server.port={grpc_http_port}", "--server.address=127.0.0.1",
+                                  f"--shenyu.register.serverLists=http://127.0.0.1:{proxy_port}",
+                                  f"--shenyu.client.grpc.props.ipAndPort=127.0.0.1:{grpc_port}",
+                                  "--shenyu.client.grpc.props.host=127.0.0.1",
+                                  f"--shenyu.client.grpc.props.port={grpc_port}", "--logging.level.org.apache.shenyu=INFO"])
+            wait_for("gRPC backend readiness", lambda: listening(grpc_port), runtime.processes)
+            wait_for("gRPC metadata", lambda: any(row["path"] == "/grpc/echo" and row["rpcType"] == "grpc" for row in page("/meta-data/queryList")), runtime.processes)
+            def grpc_response():
+                status, body, _ = request(gateway_url + "/grpc/echo", {"data": [{"message": "migration-7602"}]})
                 value = json.loads(body)
-                return value if status == 200 and value == expected_response else None
-            rpc_results[method] = wait_for("gRPC " + method, rpc_response, runtime.processes)
-        report["checks"]["grpc_unary_and_streaming"] = rpc_results
-        runtime.stop(grpc)
-        runtime.processes = [(name, process) for name, process in runtime.processes if process is not grpc]
-        wait_for("gRPC offline request", lambda: proxy.matching("/shenyu-client/offline", "/grpc", "OFFLINE"), runtime.processes)
-        wait_for("gRPC gateway empty snapshot", lambda: gateway_snapshot(output / "gateway.log", "/grpc") == [], runtime.processes)
-        report["checks"]["grpc_shutdown_removed_upstream"] = True
+                return value if status == 200 and isinstance(value, list) and value and value[0].get("message") == "ReceivedHELLO" else None
+            response = wait_for("real gRPC gateway proxy", grpc_response, runtime.processes)
+            report["checks"]["grpc_registered_and_proxied"] = response
+            rpc_cases = {
+                "helloService/hello": ({"data": [{"data": "migration-7602"}]}, [{"data": "hello: migration-7602"}]),
+                "unaryFun": ({"data": [{"text": "migration-7602"}]}, [{"text": "unaryFun response: hello gRPC"}]),
+                "serverStreamingFun": ({"data": [{"text": "migration-7602"}]}, [{"text": f"serverStreamingFun response: hello {index}"} for index in range(10)]),
+                "clientStreamingFun": ({"data": [{"text": "first"}, {"text": "second"}]}, [{"text": "clientStreamingFun onCompleted"}]),
+                "bidiStreamingFun": ({"data": [{"text": "first"}, {"text": "second"}]}, [{"text": "bidiStreamingFun response: hello"},
+                                                                                          {"text": "bidiStreamingFun response: hello"}, {"text": "bidiStreamingFun onCompleted"}]),
+            }
+            rpc_results = {}
+            for method, (payload, expected_response) in rpc_cases.items():
+                def rpc_response():
+                    status, body, _ = request(gateway_url + "/grpc/" + method, payload)
+                    value = json.loads(body)
+                    return value if status == 200 and value == expected_response else None
+                rpc_results[method] = wait_for("gRPC " + method, rpc_response, runtime.processes)
+            report["checks"]["grpc_unary_and_streaming"] = rpc_results
+            runtime.stop(grpc)
+            runtime.processes = [(name, process) for name, process in runtime.processes if process is not grpc]
+            wait_for("gRPC offline request", lambda: proxy.matching("/shenyu-client/offline", "/grpc", "OFFLINE"), runtime.processes)
+            wait_for("gRPC gateway empty snapshot", lambda: gateway_snapshot(output / "gateway.log", "/grpc") == [], runtime.processes)
+            report["checks"]["grpc_shutdown_removed_upstream"] = True
 
-        enable_plugin("mcpServer")
-        sockets[9].close()
-        mcp = runtime.start("mcp-client", mcp_cp, "org.apache.shenyu.examples.ShenyuTestMcpApplication",
-                            [f"--server.port={mcp_port}", "--server.address=127.0.0.1",
-                             f"--shenyu.register.serverLists=http://127.0.0.1:{proxy_port}"])
-        wait_for("MCP example readiness", lambda: request(f"http://127.0.0.1:{mcp_port}/order/findAll")[0] == 200, runtime.processes)
-        wait_for("MCP registration", lambda: len(proxy.matching("/shenyu-client/register-mcp")) == 3, runtime.processes)
-        wait_for("MCP backend upstream", lambda: gateway_snapshot(output / "gateway.log", "/mcp") == [f"127.0.0.1:{mcp_port}"], runtime.processes)
-        wait_for("MCP rules", lambda: any(row["name"] == "/mcp" for row in page("/selector", pluginId="61")), runtime.processes)
-        configs = verify_mcp_wire(proxy.matching("/shenyu-client/register-mcp"), mcp_port)
-        selectors = [row for row in page("/selector", pluginId="61") if row["name"] == "/mcp"]
-        def mcp_rules():
-            rows = page("/rule", selectorId=selectors[0]["id"])
-            return rows if {row["name"] for row in rows} == set(configs) else None
-        rules = wait_for("MCP tool rules in Admin", mcp_rules, runtime.processes)
-        stored_configs = {row["name"]: json.loads(row["handle"]) for row in rules}
-        require(stored_configs == configs, stored_configs)
-        report["checks"]["mcp_nested_registration_preserved"] = True
-        report["checks"]["mcp_registered_and_called"] = runtime.probe("mcp-tool-calls", probe_cp, ["mcp", gateway_url, "/mcp/streamablehttp"])
-        runtime.stop(mcp)
-        runtime.processes = [(name, process) for name, process in runtime.processes if process is not mcp]
-        wait_for("MCP HTTP offline request", lambda: proxy.matching("/shenyu-client/offline", "/mcp", "OFFLINE"), runtime.processes)
-        wait_for("MCP backend gateway empty snapshot", lambda: gateway_snapshot(output / "gateway.log", "/mcp") == [], runtime.processes)
-        report["checks"]["mcp_backend_shutdown_removed_upstream"] = True
-        verify_wire(proxy.events, manifest["client_preparation_version"])
-        report["checks"]["authenticated_v1_wire_contract"] = True
-        report["result"] = "passed"
+            enable_plugin("mcpServer")
+            sockets[9].close()
+            mcp = runtime.start("mcp-client", mcp_cp, "org.apache.shenyu.examples.ShenyuTestMcpApplication",
+                                [f"--server.port={mcp_port}", "--server.address=127.0.0.1",
+                                 f"--shenyu.register.serverLists=http://127.0.0.1:{proxy_port}"])
+            wait_for("MCP example readiness", lambda: request(f"http://127.0.0.1:{mcp_port}/order/findAll")[0] == 200, runtime.processes)
+            wait_for("MCP registration", lambda: len(proxy.matching("/shenyu-client/register-mcp")) == 3, runtime.processes)
+            wait_for("MCP backend upstream", lambda: gateway_snapshot(output / "gateway.log", "/mcp") == [f"127.0.0.1:{mcp_port}"], runtime.processes)
+            wait_for("MCP rules", lambda: any(row["name"] == "/mcp" for row in page("/selector", pluginId="61")), runtime.processes)
+            configs = verify_mcp_wire(proxy.matching("/shenyu-client/register-mcp"), mcp_port)
+            selectors = [row for row in page("/selector", pluginId="61") if row["name"] == "/mcp"]
+            def mcp_rules():
+                rows = page("/rule", selectorId=selectors[0]["id"])
+                return rows if {row["name"] for row in rows} == set(configs) else None
+            rules = wait_for("MCP tool rules in Admin", mcp_rules, runtime.processes)
+            stored_configs = {row["name"]: json.loads(row["handle"]) for row in rules}
+            require(stored_configs == configs, stored_configs)
+            report["checks"]["mcp_nested_registration_preserved"] = True
+            report["checks"]["mcp_registered_and_called"] = runtime.probe("mcp-tool-calls", probe_cp, ["mcp", gateway_url, "/mcp/streamablehttp"])
+            runtime.stop(mcp)
+            runtime.processes = [(name, process) for name, process in runtime.processes if process is not mcp]
+            wait_for("MCP HTTP offline request", lambda: proxy.matching("/shenyu-client/offline", "/mcp", "OFFLINE"), runtime.processes)
+            wait_for("MCP backend gateway empty snapshot", lambda: gateway_snapshot(output / "gateway.log", "/mcp") == [], runtime.processes)
+            report["checks"]["mcp_backend_shutdown_removed_upstream"] = True
+            verify_wire(proxy.events, manifest["client_preparation_version"])
+            report["checks"]["authenticated_v1_wire_contract"] = True
+            report["result"] = "passed"
     except subprocess.CalledProcessError as error:
         report["error"] = f"{Path(error.cmd[0]).name} failed with exit code {error.returncode}; inspect the build/compile logs"
     except Exception as error:
@@ -615,7 +675,10 @@ def listening(port):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--main-source", type=Path, help="Clean checkout at .github/migration-source.json's main SHA")
+    parser.add_argument("--main-source", type=Path, help="Clean checkout at the pinned foundation commit")
+    parser.add_argument("--main-runtime-source", type=Path, help="Optional clean checkout for building Admin and gateway")
+    parser.add_argument("--gateway-patch-jar", type=Path, help="Explicitly overlay a locally rebuilt gateway component and record its digest")
     parser.add_argument("--maven-repo", type=Path, help="Use the same local Maven repository for both builds")
     parser.add_argument("--skip-build", action="store_true", help="Reuse this script's existing installs and runtime classpaths")
+    parser.add_argument("--suite", choices=SUITES, default="core", help="Runtime scenario suite")
     sys.exit(run(Path(__file__).resolve().parents[1], parser.parse_args()))

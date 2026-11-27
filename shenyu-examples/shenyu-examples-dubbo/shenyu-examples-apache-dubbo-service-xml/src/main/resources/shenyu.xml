@@ -27,7 +27,7 @@
     <!-- config ShenyuRegisterCenterConfig according to your registerType -->
     <bean id="shenyuRegisterCenterConfig" class="org.apache.shenyu.register.common.config.ShenyuRegisterCenterConfig">
         <property name="registerType" value="http"/>
-        <property name="serverLists" value="http://localhost:9095"/>
+        <property name="serverLists" value="${shenyu.register.serverLists:http://localhost:9095}"/>
         <property name="props">
             <props>
                 <prop key="username">admin</prop>
@@ -41,8 +41,8 @@
           class="org.apache.shenyu.register.common.config.ShenyuClientConfig.ClientPropertiesConfig">
         <property name="props">
             <map>
-                <entry key="contextPath" value="/dubbo"/>
-                <entry key="appName" value="dubbo"/>
+                <entry key="contextPath" value="${shenyu.client.dubbo.props.contextPath:/dubbo}"/>
+                <entry key="appName" value="${shenyu.client.dubbo.props.appName:dubbo}"/>
             </map>
         </property>
     </bean>
