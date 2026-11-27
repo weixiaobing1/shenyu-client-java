@@ -15,7 +15,8 @@
  * limitations under the License.
  */
 
-import com.google.gson.JsonObject;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonParser;
 import io.modelcontextprotocol.client.McpClient;
 import io.modelcontextprotocol.client.McpSyncClient;
 import io.modelcontextprotocol.client.transport.HttpClientStreamableHttpTransport;
@@ -92,8 +93,12 @@ public final class RuntimeProbe {
             }
             McpSchema.CallToolResult order = client.callTool(new McpSchema.CallToolRequest("findOrderById", Map.of("id", "7602")));
             String orderText = content(order);
-            JsonObject orderJson = GsonUtils.getInstance().fromJson(orderText, JsonObject.class);
-            if (!orderJson.has("id") || !"7602".equals(orderJson.get("id").getAsString())) {
+            JsonElement orderJson = JsonParser.parseString(orderText);
+            if (orderJson.isJsonPrimitive() && orderJson.getAsJsonPrimitive().isString()) {
+                orderJson = JsonParser.parseString(orderJson.getAsString());
+            }
+            if (!orderJson.isJsonObject() || !orderJson.getAsJsonObject().has("id")
+                    || !"7602".equals(orderJson.getAsJsonObject().get("id").getAsString())) {
                 throw new IllegalStateException("MCP query argument did not reach the backend: " + orderText);
             }
             Map<String, Object> evidence = new HashMap<>();

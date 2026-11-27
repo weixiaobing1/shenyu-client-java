@@ -32,6 +32,16 @@ SPEC.loader.exec_module(RUNTIME)
 
 
 class RuntimeTest(unittest.TestCase):
+    def test_framework_suites_select_independent_example_jars(self):
+        scenarios = RUNTIME.runtime_scenarios
+        self.assertEqual(scenarios.modules("core"), ())
+        self.assertEqual(len(scenarios.modules("websocket")), 1)
+        annotation, xml = scenarios.modules("dubbo")
+        self.assertEqual(scenarios.artifact(annotation, "candidate"),
+                         "shenyu-examples-apache-dubbo-service-annotation-candidate.jar")
+        self.assertEqual(scenarios.artifact(xml, "candidate"),
+                         "shenyu-examples-apache-dubbo-service-xml.jar")
+
     def valid_event(self):
         return {"path": "/shenyu-client/register-uri", "body": {"port": 8189, "namespaceId": RUNTIME.NAMESPACE,
                 "instanceInfo": '{"pid":"123"}'}, "status": 200, "protocol_version": "1", "client_version": "candidate",
