@@ -76,6 +76,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [core, websocket, dubbo]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -86,13 +90,28 @@ jobs:
           cache-dependency-path: |
             **/pom.xml
             .github/migration-source.json
-      - name: Verify registration, registry updates, gRPC and MCP through the gateway
-        run: python3 script/verify-runtime.py
+      - name: Check out framework test Admin and Bootstrap
+        if: matrix.suite != 'core'
+        uses: actions/checkout@v4
+        with:
+          repository: apache/shenyu
+          ref: ada1872599eae871648d6760a05d7747459ea051
+          path: target/framework-main
+          persist-credentials: false
+      - name: Verify runtime through the gateway
+        env:
+          RUNTIME_SUITE: ${{ matrix.suite }}
+        run: |
+          args=(--suite "$RUNTIME_SUITE")
+          if [[ "$RUNTIME_SUITE" != core ]]; then
+            args+=(--main-runtime-source target/framework-main)
+          fi
+          python3 script/verify-runtime.py "${args[@]}"
       - name: Preserve runtime evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: source-runtime-java17
+          name: source-runtime-java17-${{ matrix.suite }}
           retention-days: 7
           path: |
             target/prepare-foundations.log
@@ -104,6 +123,10 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [core, websocket, dubbo]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -114,13 +137,28 @@ jobs:
           cache-dependency-path: |
             **/pom.xml
             .github/migration-source.json
-      - name: Verify Java 21 runtime compatibility using the main-repository push policy
-        run: python3 script/verify-runtime.py
+      - name: Check out framework test Admin and Bootstrap
+        if: matrix.suite != 'core'
+        uses: actions/checkout@v4
+        with:
+          repository: apache/shenyu
+          ref: ada1872599eae871648d6760a05d7747459ea051
+          path: target/framework-main
+          persist-credentials: false
+      - name: Verify Java 21 runtime compatibility
+        env:
+          RUNTIME_SUITE: ${{ matrix.suite }}
+        run: |
+          args=(--suite "$RUNTIME_SUITE")
+          if [[ "$RUNTIME_SUITE" != core ]]; then
+            args+=(--main-runtime-source target/framework-main)
+          fi
+          python3 script/verify-runtime.py "${args[@]}"
       - name: Preserve runtime evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: source-runtime-java21
+          name: source-runtime-java21-${{ matrix.suite }}
           retention-days: 7
           path: |
             target/prepare-foundations.log
