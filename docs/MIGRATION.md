@@ -117,6 +117,34 @@ The runner's evidence guards have negative tests in `script/test-runtime.py`.
 `--skip-build` is only for local replay of an earlier runner build; it refuses
 changed client Java, POM, resource or migration-manifest inputs.
 
+### Framework runtime coverage
+
+Run each suite on Java 17 and Java 21 from a clean client checkout. The
+foundation revision remains in the migration manifest. The framework lanes use
+the separately built Apache ShenYu runtime at
+`ada1872599eae871648d6760a05d7747459ea051`.
+
+```sh
+python3 script/test-runtime.py
+python3 script/verify-runtime.py --suite core
+python3 script/verify-runtime.py --suite websocket --main-runtime-source /path/to/framework-main
+python3 script/verify-runtime.py --suite dubbo --main-runtime-source /path/to/framework-main
+```
+
+| Framework | Candidate fixture and discovery | Coverage or blocker |
+| --- | --- | --- |
+| WebSocket | Spring native WebSocket example using annotation registration and `isFull` with local discovery, and `isFull` with ZooKeeper | Admin route, real gateway upgrade, exact payload echo, close frame and provider close. The route must follow graceful shutdown, forced exit and sibling survival. |
+| Apache Dubbo | `shenyu-examples-apache-dubbo-service-annotation` and `shenyu-examples-apache-dubbo-service-xml`, Dubbo 3.2.14, ZooKeeper and the main Apache Dubbo gateway plugin | Admin persists the service and method metadata. A real gateway invocation must return the fixture payload, then route state and the response must match the surviving providers after graceful shutdown and forced exit. |
+| SOFA | Independent SOFA starter and the pinned default Bootstrap distribution | Unverified. The migration examples reactor has no SOFA provider fixture and the tested default Bootstrap classpath has no SOFA gateway starter/plugin. Pin a provider and an explicitly assembled Bootstrap before advertising this combination. |
+| TARS | Independent TARS starter and the pinned default Bootstrap distribution | Unverified. The tested default Bootstrap classpath has no TARS gateway starter/plugin. The external starter's ownership, parity and E2E evidence are tracked in [apache/shenyu#7296](https://github.com/apache/shenyu/issues/7296). |
+
+Only a passing report for a specific source pair and JDK constitutes evidence
+for that combination. Record the client and main revisions, selected fixture
+JAR digest, framework/registry versions, Admin state and gateway assertions
+with each submission. Keep credentials and local tokens out of published logs.
+The SOFA and TARS entries identify boundaries of the source candidate. Published
+release pairs require their own versioned runtime verification.
+
 The runner enables gRPC and MCP only in its fresh in-memory Admin. gRPC verifies
 method and class annotation registration, a real echo response, unary invocation,
 ten server-stream responses, client-stream completion and bidirectional messages
